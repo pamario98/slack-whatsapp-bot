@@ -22,23 +22,34 @@ PROFILE_FILE = "user_profile.json"
 # ============ FUNCIONES AUXILIARES =============
 
 def send_whatsapp(message: str):
-    """Envía mensaje por WhatsApp Cloud API"""
-    try:
-        url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "messaging_product": "whatsapp",
-            "to": WHATSAPP_TO,
-            "type": "text",
-            "text": {"body": message}
-        }
-        r = requests.post(url, headers=headers, json=data)
-        print("Respuesta WhatsApp:", r.status_code, r.text)
-    except Exception as e:
-        print("Error enviando WhatsApp:", e)
+    """
+    Envía mensaje por WhatsApp Cloud API a TODOS los números
+    listados en WHATSAPP_TO (separados por coma).
+    """
+    if not WHATSAPP_TO:
+        print("WHATSAPP_TO vacío, no se envía nada.")
+        return
+
+    # Ejemplo: "+524791385506,+524776487162" -> ["+524791385506", "+524776487162"]
+    numbers = [n.strip() for n in WHATSAPP_TO.split(",") if n.strip()]
+
+    for num in numbers:
+        try:
+            url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
+            headers = {
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "messaging_product": "whatsapp",
+                "to": num,
+                "type": "text",
+                "text": {"body": message},
+            }
+            r = requests.post(url, headers=headers, json=data)
+            print(f"Respuesta WhatsApp a {num}:", r.status_code, r.text)
+        except Exception as e:
+            print(f"Error enviando WhatsApp a {num}:", e)
 
 
 def load_state():
@@ -129,7 +140,7 @@ def main_loop():
         except SlackApiError as e:
             print("Error Slack:", e.response.get("error"))
 
-        time.sleep(10)  # <================= AQUÍ SE CAMBIA LA FRECUENCIA
+        time.sleep(10)  # <================= FRECUENCIA DE CHEQUEO
 
 
 if __name__ == "__main__":
