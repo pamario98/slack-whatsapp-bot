@@ -5,6 +5,7 @@ import requests
 import os
 import json
 import time
+import pytz   # <-- para zona horaria México
 
 # ============ VARIABLES DE ENTORNO =============
 
@@ -13,10 +14,13 @@ TARGET_USER = os.environ.get("TARGET_USER")
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
-WHATSAPP_TO = os.environ.get("WHATSAPP_TO")
+WHATSAPP_TO = os.environ.get("WHATSAPP_TO")  # puede tener 1 o varios números separados por coma
 
 STATE_FILE = "presence_state.json"
 PROFILE_FILE = "user_profile.json"
+
+# Zona horaria (México)
+MX_TZ = pytz.timezone("America/Mexico_City")
 
 
 # ============ FUNCIONES AUXILIARES =============
@@ -30,12 +34,13 @@ def send_whatsapp(message: str):
         print("WHATSAPP_TO vacío, no se envía nada.")
         return
 
-    # Ejemplo: "+524791385506,+524776487162" -> ["+524791385506", "+524776487162"]
+    # Ejemplo: "+524791385506,+524776487162"
+    # -> ["+524791385506", "+524776487162"]
     numbers = [n.strip() for n in WHATSAPP_TO.split(",") if n.strip()]
 
     for num in numbers:
         try:
-            url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
+            url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
             headers = {
                 "Authorization": f"Bearer {WHATSAPP_TOKEN}",
                 "Content-Type": "application/json",
@@ -112,25 +117,46 @@ def main_loop():
     slack = WebClient(token=SLACK_BOT_TOKEN)
     person_name = get_user_name(slack, TARGET_USER)
 
+    # Cargamos el último estado guardado (puede ser None si es la primera vez)
     old_state = load_state()
 
     while True:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Hora local de México
+        now_str = datetime.now(MX_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             resp = slack.users_getPresence(user=TARGET_USER)
-            new_state = resp.get("presence")
+            new_state = resp.get("presence")  # 'active' o 'away'
 
             if old_state != new_state:
-                if old_state is not None:
-                    # No mandar mensaje la primera vez
+                # Siempre mandamos alerta cuando hay cambio,
+                # incluso la PRIMERA VEZ (old_state es None)
+                if old_state is None:
+                    text = (
+                        f"🔵 Estado inicial de {person_name} en Slack: {new_state}\n"
+                        f"{now_str}"
+                    )
+                else:
                     if new_state == "active":
-                        text = f"🟢 {person_name} se CONECTÓ ({old_state} → {new_state})\n{now_str}"
+                        text = (
+                            f"🟢 {person_name} se CONECTÓ "
+                            f"({old_state} → {new_state})\n{now_str}"
+                        )
+                    elif new_state == "away":
+                        text = (
+                            f"🔴 {person_name} se DESCONECTÓ "
+                            f"({old_state} → {new_state})\n{now_str}"
+                        )
                     else:
-                        text = f"🔴 {person_name} se DESCONECTÓ ({old_state} → {new_state})\n{now_str}"
+                        text = (
+                            f"⚪ {person_name} cambió de estado "
+                            f"({old_state} → {new_state})\n{now_str}"
+                        )
 
-                    send_whatsapp(text)
+                # Enviamos WhatsApp (incluye el caso inicial)
+                send_whatsapp(text)
 
+                # Guardamos y actualizamos estado
                 save_state(new_state)
                 old_state = new_state
                 print(f"Cambio detectado: {new_state}")
@@ -140,7 +166,8 @@ def main_loop():
         except SlackApiError as e:
             print("Error Slack:", e.response.get("error"))
 
-        time.sleep(10)  # <================= FRECUENCIA DE CHEQUEO
+        # Intervalo de chequeo (segundos)
+        time.sleep(10)
 
 
 if __name__ == "__main__":
