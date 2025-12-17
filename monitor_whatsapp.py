@@ -19,6 +19,10 @@ WHATSAPP_TO = os.environ.get("WHATSAPP_TO")  # puede tener 1 o varios números s
 STATE_FILE = "presence_state.json"
 PROFILE_FILE = "user_profile.json"
 
+# Keep-alive (20 horas)
+KEEPALIVE_SECONDS = 20 * 60 * 60
+KEEPALIVE_FILE = "keepalive_state.json"
+
 # Zona horaria (México)
 MX_TZ = pytz.timezone("America/Mexico_City")
 
@@ -34,8 +38,6 @@ def send_whatsapp(message: str):
         print("WHATSAPP_TO vacío, no se envía nada.")
         return
 
-    # Ejemplo: "+524791385506,+524776487162"
-    # -> ["+524791385506", "+524776487162"]
     numbers = [n.strip() for n in WHATSAPP_TO.split(",") if n.strip()]
 
     for num in numbers:
@@ -103,6 +105,21 @@ def get_user_name(slack_client, user_id: str) -> str:
         return user_id
 
 
+def load_keepalive_ts():
+    if not os.path.exists(KEEPALIVE_FILE):
+        return None
+    try:
+        data = json.load(open(KEEPALIVE_FILE, "r", encoding="utf-8"))
+        return data.get("last_sent_ts")
+    except:
+        return None
+
+
+def save_keepalive_ts(ts: int):
+    with open(KEEPALIVE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last_sent_ts": ts}, f)
+
+
 # ============ MAIN LOOP =============
 
 def main_loop():
@@ -117,56 +134,57 @@ def main_loop():
     slack = WebClient(token=SLACK_BOT_TOKEN)
     person_name = get_user_name(slack, TARGET_USER)
 
-    # Cargamos el último estado guardado (puede ser None si es la primera vez)
     old_state = load_state()
+    last_sent_ts = load_keepalive_ts()  # puede ser None la primera vez
 
     while True:
-        # Hora local de México
-        now_str = datetime.now(MX_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = datetime.now(MX_TZ)
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        now_ts = int(time.time())
 
         try:
             resp = slack.users_getPresence(user=TARGET_USER)
             new_state = resp.get("presence")  # 'active' o 'away'
 
             if old_state != new_state:
-                # Siempre mandamos alerta cuando hay cambio,
-                # incluso la PRIMERA VEZ (old_state es None)
+                # Alerta por cambio (incluye estado inicial)
                 if old_state is None:
-                    text = (
-                        f"🔵 Estado inicial de {person_name} en Slack: {new_state}\n"
-                        f"{now_str}"
-                    )
+                    text = f"🔵 Estado inicial de {person_name} en Slack: {new_state}\n{now_str}"
                 else:
                     if new_state == "active":
-                        text = (
-                            f"🟢 {person_name} se CONECTÓ "
-                            f"({old_state} → {new_state})\n{now_str}"
-                        )
+                        text = f"🟢 {person_name} se CONECTÓ ({old_state} → {new_state})\n{now_str}"
                     elif new_state == "away":
-                        text = (
-                            f"🔴 {person_name} se DESCONECTÓ "
-                            f"({old_state} → {new_state})\n{now_str}"
-                        )
+                        text = f"🔴 {person_name} se DESCONECTÓ ({old_state} → {new_state})\n{now_str}"
                     else:
-                        text = (
-                            f"⚪ {person_name} cambió de estado "
-                            f"({old_state} → {new_state})\n{now_str}"
-                        )
+                        text = f"⚪ {person_name} cambió de estado ({old_state} → {new_state})\n{now_str}"
 
-                # Enviamos WhatsApp (incluye el caso inicial)
                 send_whatsapp(text)
 
-                # Guardamos y actualizamos estado
                 save_state(new_state)
                 old_state = new_state
+
+                # Reinicia contador de keep-alive (porque ya mandamos mensaje real)
+                last_sent_ts = now_ts
+                save_keepalive_ts(last_sent_ts)
+
                 print(f"Cambio detectado: {new_state}")
+
             else:
-                print(f"[{now_str}] Sin cambios ({new_state})")
+                # No hay cambios -> evaluar keep-alive cada 20h
+                if last_sent_ts is None or (now_ts - last_sent_ts) >= KEEPALIVE_SECONDS:
+                    keep_msg = f"🟦 Seguimos monitoreando… Estado actual: {new_state}\n{now_str}"
+                    send_whatsapp(keep_msg)
+
+                    last_sent_ts = now_ts
+                    save_keepalive_ts(last_sent_ts)
+
+                    print(f"[{now_str}] Keep-alive enviado. Estado: {new_state}")
+                else:
+                    print(f"[{now_str}] Sin cambios ({new_state})")
 
         except SlackApiError as e:
             print("Error Slack:", e.response.get("error"))
 
-        # Intervalo de chequeo (segundos)
         time.sleep(10)
 
 
