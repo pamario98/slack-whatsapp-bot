@@ -5,137 +5,123 @@ import requests
 import os
 import json
 import time
-import pytz   # <-- para zona horaria México
+import pytz
 
-# ============ VARIABLES DE ENTORNO =============
+# ================== CONFIG ==================
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 TARGET_USER = os.environ.get("TARGET_USER")
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
-WHATSAPP_TO = os.environ.get("WHATSAPP_TO")  # puede tener 1 o varios números separados por coma
+WHATSAPP_TO = os.environ.get("WHATSAPP_TO")  # "+52..., +52..." separados por coma
 
 STATE_FILE = "presence_state.json"
 PROFILE_FILE = "user_profile.json"
-
-# Keep-alive (20 horas)
-KEEPALIVE_SECONDS = 20 * 60 * 60
 KEEPALIVE_FILE = "keepalive_state.json"
 
-# Zona horaria (México)
+KEEPALIVE_SECONDS = 20 * 60 * 60   # 20 horas
+POLL_SECONDS = 60                  # Chequeo Slack cada 60s
+API_BLOCK_SLEEP = 30 * 60          # 30 min si Meta bloquea
+
 MX_TZ = pytz.timezone("America/Mexico_City")
 
+# ================== HELPERS ==================
 
-# ============ FUNCIONES AUXILIARES =============
-
-def send_whatsapp(message: str):
-    """
-    Envía mensaje por WhatsApp Cloud API a TODOS los números
-    listados en WHATSAPP_TO (separados por coma).
-    """
+def get_numbers():
     if not WHATSAPP_TO:
-        print("WHATSAPP_TO vacío, no se envía nada.")
-        return
+        return []
+    return [n.strip() for n in WHATSAPP_TO.split(",") if n.strip()]
 
-    numbers = [n.strip() for n in WHATSAPP_TO.split(",") if n.strip()]
+
+def send_whatsapp(message: str) -> bool:
+    numbers = get_numbers()
+    if not numbers:
+        print("WHATSAPP_TO vacío")
+        return True
+
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    blocked = False
 
     for num in numbers:
         try:
-            url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
-            headers = {
-                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-                "Content-Type": "application/json",
-            }
-            data = {
+            payload = {
                 "messaging_product": "whatsapp",
                 "to": num,
                 "type": "text",
                 "text": {"body": message},
             }
-            r = requests.post(url, headers=headers, json=data)
-            print(f"Respuesta WhatsApp a {num}:", r.status_code, r.text)
+
+            r = requests.post(url, headers=headers, json=payload, timeout=20)
+            print(f"WhatsApp → {num}:", r.status_code, r.text)
+
+            if r.status_code == 400 and "API access blocked" in r.text:
+                blocked = True
+
         except Exception as e:
-            print(f"Error enviando WhatsApp a {num}:", e)
+            print("Error WhatsApp:", e)
+
+    if blocked:
+        print("⚠️ Meta bloqueó la API. Durmiendo 30 minutos.")
+        time.sleep(API_BLOCK_SLEEP)
+        return False
+
+    return True
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
+def load_file(path):
+    if not os.path.exists(path):
         return None
     try:
-        return open(STATE_FILE, "r").read().strip() or None
+        return json.load(open(path, "r", encoding="utf-8"))
     except:
         return None
 
 
-def save_state(state: str):
-    with open(STATE_FILE, "w") as f:
-        f.write(state)
+def save_file(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
-def load_profile():
-    if not os.path.exists(PROFILE_FILE):
-        return None
-    try:
-        return json.load(open(PROFILE_FILE, "r", encoding="utf-8"))
-    except:
-        return None
-
-
-def save_profile(profile: dict):
-    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-        json.dump(profile, f, ensure_ascii=False)
-
-
-def get_user_name(slack_client, user_id: str) -> str:
-    profile = load_profile()
-    if profile and profile.get("user_id") == user_id:
-        return profile.get("name") or user_id
+def get_user_name(slack, user_id):
+    cached = load_file(PROFILE_FILE)
+    if cached and cached.get("user_id") == user_id:
+        return cached.get("name")
 
     try:
-        resp = slack_client.users_info(user=user_id)
-        user = resp.get("user", {})
-        real_name = user.get("real_name") or user.get("profile", {}).get("real_name")
-        display_name = user.get("profile", {}).get("display_name")
-        name = real_name or display_name or user_id
-
-        save_profile({"user_id": user_id, "name": name})
+        r = slack.users_info(user=user_id)
+        u = r["user"]
+        name = (
+            u.get("real_name")
+            or u.get("profile", {}).get("display_name")
+            or user_id
+        )
+        save_file(PROFILE_FILE, {"user_id": user_id, "name": name})
         return name
     except:
         return user_id
 
 
-def load_keepalive_ts():
-    if not os.path.exists(KEEPALIVE_FILE):
-        return None
-    try:
-        data = json.load(open(KEEPALIVE_FILE, "r", encoding="utf-8"))
-        return data.get("last_sent_ts")
-    except:
-        return None
+# ================== MAIN LOOP ==================
 
-
-def save_keepalive_ts(ts: int):
-    with open(KEEPALIVE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_sent_ts": ts}, f)
-
-
-# ============ MAIN LOOP =============
-
-def main_loop():
-    if not SLACK_BOT_TOKEN or not TARGET_USER:
-        print("Faltan SLACK_BOT_TOKEN o TARGET_USER.")
-        return
-
-    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and WHATSAPP_TO):
-        print("Faltan variables de WhatsApp.")
+def main():
+    if not all([SLACK_BOT_TOKEN, TARGET_USER, WHATSAPP_TOKEN, WHATSAPP_PHONE_ID, WHATSAPP_TO]):
+        print("❌ Faltan variables de entorno")
         return
 
     slack = WebClient(token=SLACK_BOT_TOKEN)
-    person_name = get_user_name(slack, TARGET_USER)
+    name = get_user_name(slack, TARGET_USER)
 
-    old_state = load_state()
-    last_sent_ts = load_keepalive_ts()  # puede ser None la primera vez
+    state_data = load_file(STATE_FILE) or {}
+    keep_data = load_file(KEEPALIVE_FILE) or {}
+
+    old_state = state_data.get("state")
+    last_sent_ts = keep_data.get("last_sent_ts")
 
     while True:
         now_dt = datetime.now(MX_TZ)
@@ -144,49 +130,41 @@ def main_loop():
 
         try:
             resp = slack.users_getPresence(user=TARGET_USER)
-            new_state = resp.get("presence")  # 'active' o 'away'
+            new_state = resp.get("presence")
 
             if old_state != new_state:
-                # Alerta por cambio (incluye estado inicial)
                 if old_state is None:
-                    text = f"🔵 Estado inicial de {person_name} en Slack: {new_state}\n{now_str}"
+                    msg = f"🔵 Estado inicial de {name}: {new_state}\n{now_str}"
+                elif new_state == "active":
+                    msg = f"🟢 {name} se CONECTÓ\n{now_str}"
                 else:
-                    if new_state == "active":
-                        text = f"🟢 {person_name} se CONECTÓ ({old_state} → {new_state})\n{now_str}"
-                    elif new_state == "away":
-                        text = f"🔴 {person_name} se DESCONECTÓ ({old_state} → {new_state})\n{now_str}"
-                    else:
-                        text = f"⚪ {person_name} cambió de estado ({old_state} → {new_state})\n{now_str}"
+                    msg = f"🔴 {name} se DESCONECTÓ\n{now_str}"
 
-                send_whatsapp(text)
+                if send_whatsapp(msg):
+                    last_sent_ts = now_ts
+                    save_file(KEEPALIVE_FILE, {"last_sent_ts": last_sent_ts})
 
-                save_state(new_state)
                 old_state = new_state
-
-                # Reinicia contador de keep-alive (porque ya mandamos mensaje real)
-                last_sent_ts = now_ts
-                save_keepalive_ts(last_sent_ts)
-
-                print(f"Cambio detectado: {new_state}")
+                save_file(STATE_FILE, {"state": new_state})
+                print("Cambio detectado:", new_state)
 
             else:
-                # No hay cambios -> evaluar keep-alive cada 20h
                 if last_sent_ts is None or (now_ts - last_sent_ts) >= KEEPALIVE_SECONDS:
-                    keep_msg = f"🟦 Seguimos monitoreando… Estado actual: {new_state}\n{now_str}"
-                    send_whatsapp(keep_msg)
+                    keep = f"🟦 Seguimos monitoreando… Estado actual: {new_state}\n{now_str}"
+                    if send_whatsapp(keep):
+                        last_sent_ts = now_ts
+                        save_file(KEEPALIVE_FILE, {"last_sent_ts": last_sent_ts})
+                    print("Keep-alive enviado")
 
-                    last_sent_ts = now_ts
-                    save_keepalive_ts(last_sent_ts)
-
-                    print(f"[{now_str}] Keep-alive enviado. Estado: {new_state}")
                 else:
                     print(f"[{now_str}] Sin cambios ({new_state})")
 
         except SlackApiError as e:
             print("Error Slack:", e.response.get("error"))
+            time.sleep(300)
 
-        time.sleep(10)
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    main_loop()
+    main()
